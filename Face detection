@@ -1,0 +1,190 @@
+import cv2
+import sqlite3
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from deepface import DeepFace
+import os
+import logging
+from pathlib import Path
+
+# Logging sozlamalari
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='attendance.log'
+)
+
+# Keras muammosini hal qilish
+try:
+    import tf_keras
+except ModuleNotFoundError:
+    logging.warning("tf-keras topilmadi. O'rnatilmoqda...")
+    os.system("pip install tf-keras")
+    import tf_keras
+
+
+class FaceAttendanceSystem:
+    def __init__(self):
+        self.db_path = "attendance.db"
+        self.faces_dir = Path("faces")
+        self.faces_dir.mkdir(exist_ok=True)
+        self.min_confidence = 0.8  # Minimal ishonch darajasi
+        self.last_detection = {}  # Oxirgi aniqlash vaqtini saqlash
+
+    def create_database(self):
+        """Ma'lumotlar bazasini yaratish"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute('''CREATE TABLE IF NOT EXISTS attendance (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT,
+                        time TEXT,
+                        confidence REAL)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS known_faces (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT UNIQUE,
+                        image_path TEXT)''')
+            conn.commit()
+            logging.info("Ma'lumotlar bazasi muvaffaqiyatli yaratildi")
+        except Exception as e:
+            logging.error(f"DB yaratishda xatolik: {str(e)}")
+        finally:
+            conn.close()
+
+    def add_known_face(self, name, image_path):
+        """Yangi tanilgan yuz qo'shish"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO known_faces (name, image_path) VALUES (?, ?)",
+                      (name, str(image_path)))
+            conn.commit()
+            logging.info(f"{name} bazaga qo'shildi")
+        except Exception as e:
+            logging.error(f"Yuz qo'shishda xatolik: {str(e)}")
+        finally:
+            conn.close()
+
+    def mark_attendance(self, name, confidence):
+        """Davomatni belgilash"""
+        current_time = datetime.now()
+        # Har bir shaxs uchun 5 minutlik cooldown
+        if name in self.last_detection and \
+                (current_time - self.last_detection[name]).total_seconds() < 300:
+            return False
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            time_str = current_time.strftime("%Y-%m-%d %H:%M:%S")
+            c.execute("INSERT INTO attendance (name, time, confidence) VALUES (?, ?, ?)",
+                      (name, time_str, confidence))
+            conn.commit()
+            self.last_detection[name] = current_time
+            logging.info(f"{name} ro'yxatga olindi (confidence: {confidence:.2f})")
+            return True
+        except Exception as e:
+            logging.error(f"Davomat belgilashda xatolik: {str(e)}")
+            return False
+        finally:
+            conn.close()
+
+    def export_attendance(self):
+        """CSV hisobot yaratish"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            df = pd.read_sql_query("SELECT * FROM attendance", conn)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"attendance_report_{timestamp}.csv"
+            df.to_csv(filename, index=False)
+            logging.info(f"Davomat hisoboti {filename} ga saqlandi")
+        except Exception as e:
+            logging.error(f"Hisobot eksport qilishda xatolik: {str(e)}")
+        finally:
+            conn.close()
+
+    def recognize_faces(self):
+        """Yuzlarni aniqlash va davomatni belgilash"""
+        video_capture = cv2.VideoCapture(0)  # Default kamera
+        if not video_capture.isOpened():
+            logging.error("Kamera ochilmadi!")
+            return
+
+        face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+
+        while True:
+            ret, frame = video_capture.read()
+            if not ret:
+                logging.warning("Kadr olishda xatolik")
+                continue
+
+            # Yuzlarni aniqlash uchun kulrang tasvir
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+
+            for (x, y, w, h) in faces:
+                face_roi = frame[y:y + h, x:x + w]
+                try:
+                    result = DeepFace.find(
+                        img_path=face_roi,
+                        db_path=str(self.faces_dir),
+                        enforce_detection=False,
+                        model_name='Facenet512',
+                        distance_metric='euclidean_l2'
+                    )
+
+                    if len(result[0]) > 0:
+                        best_match = result[0].iloc[0]
+                        confidence = 1 - best_match['distance']  # 0-1 oralig'iga normallashtirish
+
+                        if confidence >= self.min_confidence:
+                            name = best_match['identity'].split('/')[-1].split('.')[0]
+                            if self.mark_attendance(name, confidence):
+                                color = (0, 255, 0)  # Yashil - tanildi
+                            else:
+                                color = (0, 165, 255)  # To'q sariq - allaqachon ro'yxatda
+                        else:
+                            name = "Past ishonch"
+                            color = (0, 0, 255)  # Qizil - ishonch past
+                    else:
+                        name = "Noma'lum"
+                        color = (0, 0, 255)  # Qizil - topilmadi
+
+                    # Yuz atrofida ramka va ism
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                    cv2.putText(frame, f"{name} ({confidence:.2f})",
+                                (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.9, color, 2)
+
+                except Exception as e:
+                    logging.error(f"Yuz aniqlashda xatolik: {str(e)}")
+                    cv2.putText(frame, "Xatolik", (x, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+
+            cv2.imshow('Face ID Attendance System', frame)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        video_capture.release()
+        cv2.destroyAllWindows()
+
+
+def main():
+    system = FaceAttendanceSystem()
+    system.create_database()
+
+    # Namuna ma'lumotlar qo'shish (kerak bo'lsa)
+    # system.add_known_face("John", "faces/john.jpg")
+    # system.add_known_face("Alice", "faces/alice.jpg")
+
+    system.recognize_faces()
+    system.export_attendance()
+
+
+if __name__ == "__main__":
+    main()
