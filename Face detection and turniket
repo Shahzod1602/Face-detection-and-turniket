@@ -1,0 +1,184 @@
+import cv2
+import os
+import requests
+import numpy as np
+from datetime import datetime
+from deepface import DeepFace
+from supabase import create_client, Client
+
+# Supabase configuration
+SUPABASE_URL = 
+SUPABASE_KEY = 
+
+# Initialize Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+headers = {
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "apikey": SUPABASE_KEY
+}
+
+# Configuration constants
+LATE_THRESHOLD_TIME = datetime.strptime("09:30:00", "%H:%M:%S").time()
+SAVED_IMAGES_DIR = "attendance_images"
+FACES_DIR = "known_faces"
+
+
+def download_known_faces():
+    """Download known faces from Supabase storage"""
+    os.makedirs(FACES_DIR, exist_ok=True)
+    try:
+        files = supabase.storage.from_("users").list()
+        for file in files:
+            file_name = file['name']
+            local_path = os.path.join(FACES_DIR, file_name)
+            if not os.path.exists(local_path):
+                with open(local_path, 'wb') as f:
+                    res = supabase.storage.from_("users").download(file_name)
+                    f.write(res)
+        print(f"✅ Successfully downloaded {len(files)} faces")
+    except Exception as e:
+        print(f"❌ Error downloading faces: {e}")
+
+
+def get_user_id(name):
+    """Get user ID from Supabase users table"""
+    try:
+        response = supabase.table("users").select("id").eq("name", name).execute()
+        return response.data[0]['id'] if response.data else None
+    except Exception as e:
+        print(f"❌ Error getting user ID: {e}")
+        return None
+
+
+def send_attendance(name, image_path, entry_time, exit_time=None, late=False):
+    """Send attendance data to Supabase"""
+    try:
+        user_id = get_user_id(name)
+        date_str = datetime.now().date().isoformat()
+
+        data = {
+            "id": user_id,
+            "name": name,
+            "image_path": image_path,
+            "entry_time": f"{date_str}T{entry_time}",
+            "exit_time": f"{date_str}T{exit_time}" if exit_time else None,
+            "date": date_str,
+            "late": late
+        }
+
+        response = requests.post(
+            f"{SUPABASE_URL}/rest/v1/attendance",
+            json=data,
+            headers=headers
+        )
+
+        if response.status_code in [200, 201]:
+            print(f"✅ Attendance recorded for {name}")
+        else:
+            print(f"❌ Error: {response.text}")
+    except Exception as e:
+        print(f"❌ Error sending attendance: {e}")
+
+
+def main():
+    # Initialize system
+    download_known_faces()
+    os.makedirs(SAVED_IMAGES_DIR, exist_ok=True)
+
+    # Initialize face tracking
+    detected_persons = {}
+    cap = cv2.VideoCapture(0)
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            # Process frame
+            timestamp = datetime.now()
+            temp_path = "temp_frame.jpg"
+            cv2.imwrite(temp_path, frame)
+
+            try:
+                results = DeepFace.find(
+                    img_path=temp_path,
+                    db_path=FACES_DIR,
+                    enforce_detection=False
+                )
+
+                if results and len(results[0]) > 0:
+                    best_match = results[0].iloc[0]
+                    name = os.path.splitext(os.path.basename(best_match['identity']))[0]
+                    confidence = 1 - best_match['distance']
+
+                    if confidence > 0.4:
+                        # Track detection count
+                        detected_persons.setdefault(name, {'count': 0, 'first_seen': None})
+                        detected_persons[name]['count'] += 1
+
+                        # Save and upload image
+                        img_filename = f"{name}_{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
+                        img_path = os.path.join(SAVED_IMAGES_DIR, img_filename)
+                        cv2.imwrite(img_path, frame)
+
+                        # Upload to Supabase storage
+                        with open(img_path, 'rb') as f:
+                            supabase.storage.from_("attendance_images").upload(img_filename, f)
+
+                        # Handle attendance recording
+                        if detected_persons[name]['count'] == 1:
+                            # First detection - entry
+                            entry_time = timestamp.time()
+                            is_late = entry_time > LATE_THRESHOLD_TIME
+                            send_attendance(
+                                name=name,
+                                image_path=img_filename,
+                                entry_time=entry_time.strftime("%H:%M:%S"),
+                                late=is_late
+                            )
+                            detected_persons[name]['first_seen'] = timestamp
+                        elif detected_persons[name]['count'] >= 2:
+                            # Second detection - exit
+                            exit_time = timestamp.time()
+                            send_attendance(
+                                name=name,
+                                image_path=img_filename,
+                                entry_time=detected_persons[name]['first_seen'].strftime("%H:%M:%S"),
+                                exit_time=exit_time.strftime("%H:%M:%S")
+                            )
+                            detected_persons[name]['count'] = 0  # Reset counter
+
+                else:
+                    # Handle unknown faces
+                    img_filename = f"unknown_{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
+                    img_path = os.path.join(SAVED_IMAGES_DIR, img_filename)
+                    cv2.imwrite(img_path, frame)
+
+                    with open(img_path, 'rb') as f:
+                        supabase.storage.from_("attendance_images").upload(img_filename, f)
+
+                    send_attendance(
+                        name="Unknown",
+                        image_path=img_filename,
+                        entry_time=timestamp.time().strftime("%H:%M:%S")
+                    )
+
+            except Exception as e:
+                print(f"⚠️ Face detection error: {e}")
+
+            # Display frame
+            cv2.imshow("Attendance System", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+if __name__ == "__main__":
+    main()
